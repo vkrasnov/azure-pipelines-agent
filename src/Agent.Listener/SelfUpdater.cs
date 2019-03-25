@@ -141,95 +141,150 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             IOUtil.DeleteDirectory(latestAgentDirectory, token);
             Directory.CreateDirectory(latestAgentDirectory);
 
+            int agentSuffix = 1;
             string archiveFile;
-            if (_targetPackage.Platform.StartsWith("win"))
-            {
-                archiveFile = Path.Combine(latestAgentDirectory, "agent.zip");
-            }
-            else
-            {
-                archiveFile = Path.Combine(latestAgentDirectory, "agent.tar.gz");
-            }
 
-            Trace.Info($"Save latest agent into {archiveFile}.");
-            try
+            // Download the agent, using multiple attempts in order to be resilient against any networking/CDN issues
+            for (int attempt = 1; attempt <= Constants.AgentDownloadRetryMaxAttempts; attempt++)
             {
-                using (var httpClient = new HttpClient(HostContext.CreateHttpClientHandler()))
+                // Generate an available package name, and do our best effort to clean up stale local zip files
+                while (true)
                 {
-                    //open zip stream in async mode
-                    using (FileStream fs = new FileStream(archiveFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true))
+                    if (_targetPackage.Platform.StartsWith("win"))
                     {
-                        using (Stream result = await httpClient.GetStreamAsync(_targetPackage.DownloadUrl))
+                        archiveFile = Path.Combine(latestAgentDirectory, $"agent{agentSuffix}.zip");
+                    }
+                    else
+                    {
+                        archiveFile = Path.Combine(latestAgentDirectory, $"agent{agentSuffix}.tar.gz");
+                    }
+
+                    try
+                    {
+                        // delete existing .zip file
+                        if (File.Exists(archiveFile))
                         {
-                            //81920 is the default used by System.IO.Stream.CopyTo and is under the large object heap threshold (85k). 
-                            await result.CopyToAsync(fs, 81920, token);
-                            await fs.FlushAsync(token);
+                            Trace.Verbose("Pre-download: deleting latest agent package zip '{0}'", archiveFile);
+                            IOUtil.DeleteFile(archiveFile);
                         }
-                    }
-                }
 
-                if (archiveFile.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
-                {
-                    ZipFile.ExtractToDirectory(archiveFile, latestAgentDirectory);
-                }
-                else if (archiveFile.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase))
-                {
-                    string tar = WhichUtil.Which("tar", trace: Trace);
-                    if (string.IsNullOrEmpty(tar))
+                        break;
+                    }
+                    catch (Exception ex)
                     {
-                        throw new NotSupportedException($"tar -xzf");
-                    }
-
-                    // tar -xzf
-                    using (var processInvoker = HostContext.CreateService<IProcessInvoker>())
-                    {
-                        processInvoker.OutputDataReceived += new EventHandler<ProcessDataReceivedEventArgs>((sender, args) =>
-                        {
-                            if (!string.IsNullOrEmpty(args.Data))
-                            {
-                                Trace.Info(args.Data);
-                            }
-                        });
-
-                        processInvoker.ErrorDataReceived += new EventHandler<ProcessDataReceivedEventArgs>((sender, args) =>
-                        {
-                            if (!string.IsNullOrEmpty(args.Data))
-                            {
-                                Trace.Error(args.Data);
-                            }
-                        });
-
-                        int exitCode = await processInvoker.ExecuteAsync(latestAgentDirectory, tar, $"-xzf \"{archiveFile}\"", null, token);
-                        if (exitCode != 0)
-                        {
-                            throw new NotSupportedException($"Can't use 'tar -xzf' extract archive file: {archiveFile}. return code: {exitCode}.");
-                        }
+                        // couldn't delete the file for whatever reason, so generate another name
+                        Trace.Warning("Pre-download: failed to delete agent package zip '{0}'. Exception: {1}", archiveFile, ex);
+                        agentSuffix++;
                     }
                 }
-                else
-                {
-                    throw new NotSupportedException($"{archiveFile}");
-                }
 
-                Trace.Info($"Finished getting latest agent package at: {latestAgentDirectory}.");
-            }
-            finally
-            {
+                Trace.Info($"Attempt {attempt}: save latest agent into {archiveFile}.");
+
+                bool gettingPackageSucceeded = false;
+
                 try
                 {
-                    // delete .zip file
-                    if (!string.IsNullOrEmpty(archiveFile) && File.Exists(archiveFile))
+                    bool downloadSucceeded = false;
+
+                    using (var httpClient = new HttpClient(HostContext.CreateHttpClientHandler()))
                     {
-                        Trace.Verbose("Deleting latest agent package zip: {0}", archiveFile);
-                        IOUtil.DeleteFile(archiveFile);
+                        // Set a 15-minute timeout per agent package download attempt
+                        httpClient.Timeout = TimeSpan.FromMinutes(15);
+
+                        try
+                        {
+                            //open zip stream in async mode
+                            using (FileStream fs = new FileStream(archiveFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true))
+                            {
+                                using (Stream result = await httpClient.GetStreamAsync(_targetPackage.DownloadUrl))
+                                {
+                                    //81920 is the default used by System.IO.Stream.CopyTo and is under the large object heap threshold (85k). 
+                                    await result.CopyToAsync(fs, 81920, token);
+                                    await fs.FlushAsync(token);
+                                }
+                            }
+
+                            downloadSucceeded = true;
+                        }
+                        catch (Exception ex)
+                        {
+                            Trace.Warning($"Download: failed to get package '{archiveFile}' from CDN. Exception {ex}");
+                        }
+                    }
+
+                    if (downloadSucceeded)
+                    {
+                        if (archiveFile.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                        {
+                            ZipFile.ExtractToDirectory(archiveFile, latestAgentDirectory);
+                        }
+                        else if (archiveFile.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string tar = WhichUtil.Which("tar", trace: Trace);
+                            if (string.IsNullOrEmpty(tar))
+                            {
+                                throw new NotSupportedException($"tar -xzf");
+                            }
+
+                            // tar -xzf
+                            using (var processInvoker = HostContext.CreateService<IProcessInvoker>())
+                            {
+                                processInvoker.OutputDataReceived += new EventHandler<ProcessDataReceivedEventArgs>((sender, args) =>
+                                {
+                                    if (!string.IsNullOrEmpty(args.Data))
+                                    {
+                                        Trace.Info(args.Data);
+                                    }
+                                });
+
+                                processInvoker.ErrorDataReceived += new EventHandler<ProcessDataReceivedEventArgs>((sender, args) =>
+                                {
+                                    if (!string.IsNullOrEmpty(args.Data))
+                                    {
+                                        Trace.Error(args.Data);
+                                    }
+                                });
+
+                                int exitCode = await processInvoker.ExecuteAsync(latestAgentDirectory, tar, $"-xzf \"{archiveFile}\"", null, token);
+                                if (exitCode != 0)
+                                {
+                                    throw new NotSupportedException($"Can't use 'tar -xzf' extract archive file: {archiveFile}. return code: {exitCode}.");
+                                }
+                            }
+                        }
+                        else
+                        {
+                            throw new NotSupportedException($"{archiveFile}");
+                        }
+
+                        Trace.Info($"Finished getting latest agent package at: {latestAgentDirectory}.");
+                        gettingPackageSucceeded = true;
                     }
                 }
-                catch (Exception ex)
+                finally
                 {
-                    //it is not critical if we fail to delete the temp folder
-                    Trace.Warning("Failed to delete agent package zip '{0}'. Exception: {1}", archiveFile, ex);
+                    try
+                    {
+                        // delete .zip file
+                        if (!string.IsNullOrEmpty(archiveFile) && File.Exists(archiveFile))
+                        {
+                            Trace.Verbose("Post-download: deleting latest agent package zip '{0}'", archiveFile);
+                            IOUtil.DeleteFile(archiveFile);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        //it is not critical if we fail to delete the temp folder
+                        Trace.Warning("Post-download: failed to delete agent package zip '{0}'. Exception: {1}", archiveFile, ex);
+                    }
                 }
-            }
+
+                if (gettingPackageSucceeded)
+                {
+                    Trace.Info($"Getting latest agent package took {attempt} attempts");
+                    break;
+                }
+            }       
 
             // copy latest agent into agent root folder
             // copy bin from _work/_update -> bin.version under root
