@@ -4,6 +4,7 @@
   - Calculate artifact size for pipeline artifacts #2289
   - Added lineNumber while appending timeline record feed #2310
   - Reading Environment variables and passing in RunContext #2313
+  - Support combined Cache task #2320
   
 ## Bugs
   - Warn user of buggy Git LFS version if installed #2297
@@ -13,6 +14,7 @@
   - Modifying SaveCache task to not upload files if the key exists #2308
   - Add retries for fetching github artifact details. #2324
   - Report last time build/release directory times as UTC time #2318
+  - Expand env of containers #2335
   
 ## Misc
   - N/A
